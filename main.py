@@ -5,6 +5,8 @@ import shutil
 import os
 import re
 import json
+import csv
+import sys
 from collections import defaultdict
 from github import Github
 
@@ -31,7 +33,6 @@ def clone_or_update_repo(repo_url, cache_dir):
     repo_cache_path = os.path.join(cache_dir, f"{owner}_{repo}")
 
     if os.path.exists(repo_cache_path):
-        print(f"Updating cached repository at {repo_cache_path}...")
         # Update existing repository
         update_result = subprocess.run(
             ['git', 'fetch', '--all', '--quiet'],
@@ -39,7 +40,6 @@ def clone_or_update_repo(repo_url, cache_dir):
             capture_output=True, text=True
         )
         if update_result.returncode != 0:
-            print(f"Warning: Failed to update cache, re-cloning: {update_result.stderr}")
             shutil.rmtree(repo_cache_path)
             clone_result = subprocess.run(
                 ['git', 'clone', '--quiet', repo_url, repo_cache_path],
@@ -48,7 +48,6 @@ def clone_or_update_repo(repo_url, cache_dir):
             if clone_result.returncode != 0:
                 raise RuntimeError(f"Git clone failed: {clone_result.stderr}")
     else:
-        print(f"Cloning repository to cache at {repo_cache_path}...")
         clone_result = subprocess.run(
             ['git', 'clone', '--quiet', repo_url, repo_cache_path],
             capture_output=True, text=True
@@ -61,23 +60,26 @@ def clone_or_update_repo(repo_url, cache_dir):
 
 def get_commit_email_stats(repo_path):
     """Extract commit statistics by email from git log."""
-    cmd = ['git', 'log', '--format=%ae|%H', '--all']
+    cmd = ['git', 'log', '--format=%an|%ae|%H', '--all']
     result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
 
     if result.returncode != 0:
         raise RuntimeError(f"Git log failed: {result.stderr}")
 
-    email_stats = defaultdict(lambda: {'commits': 0, 'sha': ''})
+    email_stats = defaultdict(lambda: {'commits': 0, 'sha': '', 'name': ''})
 
     for line in result.stdout.strip().split('\n'):
         line = line.strip()
-        if '|' in line:
-            email, sha = line.split('|', 1)
+        if '|' in line and line.count('|') >= 2:
+            name, email, sha = line.split('|', 2)
+            name = name.strip()
             email = email.strip()
             sha = sha.strip()
             email_stats[email]['commits'] += 1
             if not email_stats[email]['sha']:  # Store first SHA we encounter
                 email_stats[email]['sha'] = sha
+            if not email_stats[email]['name']:  # Store first name we encounter
+                email_stats[email]['name'] = name
 
     return email_stats
 
@@ -86,21 +88,18 @@ def get_github_contributors(repo_url, token=None):
     owner, repo = parse_github_url(repo_url)
     if token:
         g = Github(token)
-        print(f"Using GitHub token (rate limit: 5000/hour)")
     else:
         g = Github()
-        print(f"No token - rate limited to 60/hour")
     
     repository = g.get_repo(f"{owner}/{repo}")
     contributors = list(repository.get_contributors())
-    print(f"Found {len(contributors)} GitHub contributors")
     
     # Create login to profile mapping (email not available without extra API calls)
     login_to_profile = {}
     for contributor in contributors:
         login_to_profile[contributor.login] = contributor.html_url
     
-    return login_to_profile, repository
+    return login_to_profile, repository, g
 
 def load_profile_cache(cache_dir):
     """Load cached profile lookups."""
@@ -118,25 +117,61 @@ def save_profile_cache(cache_dir, cache):
 
 def lookup_profile_from_commit(repository, sha, cache):
     """Lookup GitHub profile from commit SHA with caching."""
-    if sha in cache:
-        print(f"Using cached profile for {sha[:12]}")
-        return cache[sha]
+    cache_key = f"commit_{sha}"
+    if cache_key in cache:
+        return cache[cache_key]
     
-    print(f"Looking up GitHub profile for commit {sha[:12]}...")
     commit = repository.get_commit(sha)
     
-    profile_url = ''
+    result = {'profile_url': '', 'name': '', 'linkedin': '', 'website': '', 'company': ''}
     if commit.author:
-        profile_url = commit.author.html_url
+        result['profile_url'] = commit.author.html_url
+        result['name'] = commit.author.name or commit.author.login
     
-    cache[sha] = profile_url
-    return profile_url
+    cache[cache_key] = result
+    return result
+
+def parse_blog_url(blog_url):
+    """Parse blog URL to separate LinkedIn, personal website, etc."""
+    if not blog_url:
+        return '', ''
+    
+    blog_url = blog_url.strip()
+    if 'linkedin.com' in blog_url.lower():
+        return blog_url, ''
+    else:
+        return '', blog_url
+
+def lookup_user_details(github_client, login, cache):
+    """Lookup full user details including blog/company with caching."""
+    cache_key = f"user_{login}"
+    if cache_key in cache:
+        return cache[cache_key]
+    
+    user = github_client.get_user(login)
+    
+    blog_url = user.blog or ''
+    
+    linkedin, website = parse_blog_url(blog_url)
+    
+    result = {
+        'profile_url': user.html_url,
+        'name': user.name or user.login,
+        'linkedin': linkedin,
+        'website': website,
+        'company': user.company or ''
+    }
+    
+    cache[cache_key] = result
+    return result
 
 def main():
     parser = argparse.ArgumentParser(description='Get commit statistics by email from repository')
     parser.add_argument('repo_url', help='GitHub repository URL')
     parser.add_argument('--token', help='GitHub personal access token')
-    parser.add_argument('--limit', type=int, default=20, help='Limit number of results (default: 20)')
+    parser.add_argument('--limit', type=int, help='Limit number of results (default: all)')
+    parser.add_argument('--min-commits', type=int, default=1, help='Minimum commits required (default: 1)')
+    parser.add_argument('--include-details', action='store_true', help='Include blog/company (requires extra API calls)')
 
     args = parser.parse_args()
 
@@ -148,38 +183,61 @@ def main():
     repo_cache_path = clone_or_update_repo(args.repo_url, cache_dir)
 
     # Get commit statistics by email
-    print("Analyzing commit history...")
     email_stats = get_commit_email_stats(repo_cache_path)
 
     # Get GitHub contributor profiles
     token = args.token or os.getenv('GITHUB_TOKEN')
-    login_to_profile, repository = get_github_contributors(args.repo_url, token)
+    login_to_profile, repository, github_client = get_github_contributors(args.repo_url, token)
 
     # Load profile cache
     profile_cache = load_profile_cache(cache_dir)
 
-    # Sort by commit count descending and limit results
-    sorted_emails = sorted(email_stats.items(), key=lambda x: x[1]['commits'], reverse=True)[:args.limit]
-
-    # Print results
-    print(f"\nShowing top {len(sorted_emails)} commit emails:\n")
-    print(f"{'Email':<40} {'Commits':<8} {'Sample SHA':<12} {'GitHub Profile'}")
-    print("-" * 120)
-
+    # Filter by minimum commits, sort by commit count descending and limit results
+    filtered_emails = [(email, stats) for email, stats in email_stats.items() if stats['commits'] >= args.min_commits]
+    sorted_emails = sorted(filtered_emails, key=lambda x: x[1]['commits'], reverse=True)
+    if args.limit:
+        sorted_emails = sorted_emails[:args.limit]
+    
+    writer = csv.writer(sys.stdout)
+    if args.include_details:
+        writer.writerow(['name', 'email', 'commits', 'sample_sha', 'github_profile', 'linkedin', 'website', 'company'])
+    else:
+        writer.writerow(['email', 'commits', 'sample_sha', 'github_profile'])
+    
     for email, stats in sorted_emails:
         # Try to match email to GitHub login (simple heuristic)
-        profile = ''
+        user_details = None
         email_user = email.split('@')[0].lower()
         for login, profile_url in login_to_profile.items():
             if login.lower() == email_user:
-                profile = profile_url
+                if args.include_details:
+                    user_details = lookup_user_details(github_client, login, profile_cache)
+                else:
+                    user_details = {'profile_url': profile_url, 'name': '', 'linkedin': '', 'website': '', 'company': ''}
                 break
         
         # If no match found, lookup from commit
-        if not profile:
-            profile = lookup_profile_from_commit(repository, stats['sha'], profile_cache)
+        if not user_details:
+            user_details = lookup_profile_from_commit(repository, stats['sha'], profile_cache)
+            
+            # If we found a commit author and want details, get them
+            if args.include_details and user_details['profile_url']:
+                login = user_details['profile_url'].split('/')[-1]
+                user_details = lookup_user_details(github_client, login, profile_cache)
         
-        print(f"{email.strip():<40} {stats['commits']:<8} {stats['sha'].strip()[:12]:<12} {profile}")
+        if args.include_details:
+            writer.writerow([
+                stats['name'],
+                email.strip(), 
+                stats['commits'], 
+                stats['sha'].strip(), 
+                user_details.get('profile_url', ''),
+                user_details.get('linkedin', ''),
+                user_details.get('website', ''),
+                user_details.get('company', '')
+            ])
+        else:
+            writer.writerow([email.strip(), stats['commits'], stats['sha'].strip(), user_details.get('profile_url', '')])
 
     # Save updated cache
     save_profile_cache(cache_dir, profile_cache)
